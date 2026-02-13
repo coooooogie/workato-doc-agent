@@ -25,18 +25,30 @@ export interface RunSummaryInput {
   errors: string[];
 }
 
+/** Schema and sample data for a lookup table referenced by recipe code. */
+export interface LookupTableContext {
+  id: number;
+  name: string;
+  columns: string[];
+  sampleRows: Array<Record<string, unknown>>;
+}
+
 export interface AIClient {
   analyzeSemanticChange(
     oldRecipe: WorkatoRecipe,
     newRecipe: WorkatoRecipe
   ): Promise<SemanticChangeResult>;
 
-  generateDocumentation(recipe: WorkatoRecipe): Promise<DocumentationResult>;
+  generateDocumentation(
+    recipe: WorkatoRecipe,
+    lookupTables?: LookupTableContext[]
+  ): Promise<DocumentationResult>;
 
   generateProjectDocumentation(
     projectName: string,
     projectDescription: string | undefined,
-    recipes: WorkatoRecipe[]
+    recipes: WorkatoRecipe[],
+    lookupTables?: LookupTableContext[]
   ): Promise<DocumentationResult>;
 
   assessQuality(

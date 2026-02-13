@@ -4,151 +4,223 @@ import type { WorkatoRecipe } from "../api/workato-client.js";
 import type {
   AIClient,
   DocumentationResult,
+  LookupTableContext,
   QualityResult,
   RunSummaryInput,
   SemanticChangeResult,
 } from "./ai-client.js";
 
 // ---------------------------------------------------------------------------
-// System & user prompts for non-technical data-mapping documentation
+// Static instruction blocks – live in the system prompt so they benefit from
+// Anthropic prompt caching across calls.  Every detail is preserved; the
+// Avoid/Use pairs are merged into single lines and the per-section bullets
+// are condensed into one-liners without removing any guidance.
 // ---------------------------------------------------------------------------
 
-const DOC_GEN_SYSTEM = `You are a technical documentation specialist who excels at translating complex integration workflows into clear, concise documentation for non-technical business users. Your goal is to make technical concepts accessible without oversimplifying or losing important details.`;
+const REQUIRED_SECTIONS = `
+Required sections:
+1. **Overview** (2-3 sentences): What the integration does and which systems are connected.
+2. **Field Mapping Table** (Target Field | Source Field | Notes): Use friendly field names, not technical paths. Include brief plain-language notes.
+3. **Data Transformations** (if applicable): How data is reformatted or combined — use examples like "Smith, Johnny", not pseudocode.
+4. **Sync Rules & Conditions**: When data syncs vs. not. Use ✓/✗ emojis. Focus on business logic, not technical conditions.
+5. **Common Scenarios** (3-5): "Scenario: [Description]" → "Action: [What the system does]".
+6. **Special Rules & Exceptions**: Important business rules and edge cases — keep brief.
+7. **When It Runs**: Trigger description and frequency in plain language.
+8. **Important Notes** (3-5 bullets): Key things users should know, limitations, one-way sync warnings.`;
 
 const STYLE_GUIDELINES = `
-### Style Guidelines:
+Style guidelines:
+- Avoid technical field names (e.g. \`dates.terminated\`); use friendly names ("Termination Date", "the HR system").
+- Avoid code blocks, formulas, or pseudo-code; use plain language with examples.
+- Use short sentences, bullet points, and tables — no long paragraphs.
+- Use active voice and direct statements — no passive voice or hedge words.`;
 
-- **Avoid:** Technical field names like \`dates.terminated\` or API endpoints
-- **Use:** Friendly names like "Termination Date" or "the HR system"
-- **Avoid:** Code blocks, formulas, or pseudo-code
-- **Use:** Plain language descriptions with examples
-- **Avoid:** Long paragraphs
-- **Use:** Short sentences, bullet points, and tables
-- **Avoid:** Passive voice and technical hedge words
-- **Use:** Active voice and direct statements`;
-
-const REQUIRED_SECTIONS = `
-### Required Sections:
-
-1. **Overview** (2-3 sentences)
-   - What does this integration do?
-   - What systems are connected?
-
-2. **Field Mapping Table**
-   - Simple table showing: Target Field | Source Field | Notes
-   - Use friendly field names, not technical field paths
-   - Include brief, helpful notes in plain language
-
-3. **Data Transformations** (if applicable)
-   - How is data reformatted or combined?
-   - Use examples like "Smith, Johnny" not pseudocode
-   - Explain the logic in everyday language
-
-4. **Sync Rules & Conditions**
-   - When does data sync vs. not sync?
-   - Use checkmark and X emojis for visual clarity
-   - Focus on business logic, not technical conditions
-
-5. **Common Scenarios**
-   - What happens when X occurs?
-   - Write as "Scenario 1: [Description]" followed by "Action: [What the system does]"
-   - Cover 3-5 most common cases
-
-6. **Special Rules & Exceptions**
-   - Any important business rules to know
-   - Edge cases that affect users
-   - Keep it brief and relevant
-
-7. **When It Runs**
-   - Trigger description in plain language
-   - Frequency or timing information
-
-8. **Important Notes**
-   - Key things users should know
-   - Limitations or one-way sync warnings
-   - 3-5 bullet points maximum`;
-
-const DOC_GEN_USER = (recipe: WorkatoRecipe) => `
-I need you to create a data mapping document for an integration workflow. The document should be:
-
-1. **Concise and readable** - avoid technical jargon, use plain language
-2. **Business-focused** - explain "what" and "why" rather than "how"
-3. **Well-organized** - use clear sections with tables and bullet points
-4. **Practical** - include real-world examples and scenarios
-
-Please analyze the following integration configuration and create a data mapping guide.
-
+const DOC_GEN_SYSTEM = `You are a technical documentation specialist who translates complex integration workflows into clear, concise documentation for non-technical business users.
 ${REQUIRED_SECTIONS}
-
-${STYLE_GUIDELINES}
-
-### Integration Configuration to Analyze:
-
-Recipe name: ${sanitizeForPrompt(recipe.name)}
-Description: ${sanitizeForPrompt(recipe.description ?? "(none)")}
-Trigger application: ${recipe.trigger_application ?? "unknown"}
-Action applications: ${(recipe.action_applications ?? []).join(", ")}
-Applications used: ${(recipe.applications ?? []).join(", ")}
-
-Recipe code (JSON structure of trigger and actions):
-${typeof recipe.code === "string" ? recipe.code : JSON.stringify(recipe.code)}
-
-Connections (config):
-${JSON.stringify(recipe.config ?? [], null, 2)}
-
-Please generate the documentation following this structure and style.
-Output valid JSON with a single "markdown" key: {"markdown": "..."}
-`;
+${STYLE_GUIDELINES}`;
 
 const PROJECT_DOC_GEN_SYSTEM = DOC_GEN_SYSTEM;
+
+// ---------------------------------------------------------------------------
+// Helpers – strip noise from recipe JSON, deduplicate apps, format lookups
+// ---------------------------------------------------------------------------
+
+/**
+ * Workato recipe-code keys that are UI / framework metadata and carry no
+ * information relevant to documentation (field mappings, logic, providers).
+ */
+const RECIPE_CODE_STRIP_KEYS = new Set([
+  "uuid",                           // internal step identifier
+  "number",                         // step sequence (implicit from order)
+  "as",                             // internal variable binding name
+  "description",                    // auto-generated HTML step label – redundant with provider+name+input
+  "visible_config_fields",          // UI visibility metadata
+  "visible_config_fields_for_action",
+  "toggleCfg",                      // UI toggle state
+]);
+
+/**
+ * Strip noise fields from Workato recipe code and return compact JSON.
+ * Preserves all documentation-relevant data: providers, action names, inputs,
+ * outputs, conditionals (if/elsif/else), dynamic pick-list selections, and
+ * nested blocks.
+ */
+function compactRecipeCode(code: string | object | undefined): string {
+  if (!code) return "{}";
+
+  let parsed: unknown;
+  try {
+    parsed = typeof code === "string" ? JSON.parse(code) : code;
+  } catch {
+    return typeof code === "string" ? code : JSON.stringify(code);
+  }
+
+  function strip(obj: unknown): unknown {
+    if (Array.isArray(obj)) return obj.map(strip);
+    if (obj !== null && typeof obj === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+        if (RECIPE_CODE_STRIP_KEYS.has(k)) continue;
+        if (v === null || v === undefined) continue;
+        out[k] = strip(v);
+      }
+      return out;
+    }
+    return obj;
+  }
+
+  return JSON.stringify(strip(parsed));
+}
+
+/**
+ * Merge trigger_application, action_applications and applications into a
+ * single de-duplicated string with the trigger marked.
+ *
+ *   "workday (trigger), salesforce, slack"
+ */
+function formatApps(recipe: WorkatoRecipe): string {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+
+  if (recipe.trigger_application) {
+    parts.push(`${recipe.trigger_application} (trigger)`);
+    seen.add(recipe.trigger_application.toLowerCase());
+  }
+
+  for (const a of recipe.action_applications ?? []) {
+    const key = a.toLowerCase();
+    if (!seen.has(key)) {
+      parts.push(a);
+      seen.add(key);
+    }
+  }
+
+  for (const a of recipe.applications ?? []) {
+    const key = a.toLowerCase();
+    if (!seen.has(key)) {
+      parts.push(a);
+      seen.add(key);
+    }
+  }
+
+  return parts.join(", ") || "unknown";
+}
+
+/**
+ * Format lookup-table context for inclusion in an LLM prompt.
+ * Uses compact JSON (no indentation) for sample rows.
+ * Returns an empty string when no tables are provided.
+ */
+function formatLookupTablesForPrompt(
+  tables: LookupTableContext[] | undefined
+): string {
+  if (!tables || tables.length === 0) return "";
+
+  const sections = tables.map((t) => {
+    const lines = [`"${sanitizeForPrompt(t.name)}" (ID:${t.id})`];
+    if (t.columns.length > 0) lines.push(`Columns: ${t.columns.join(", ")}`);
+    if (t.sampleRows.length > 0) {
+      lines.push(`Sample rows: ${JSON.stringify(t.sampleRows)}`);
+    }
+    return lines.join("\n");
+  });
+
+  return `\nLookup tables:\n${sections.join("\n\n")}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// User prompts – kept lean; static instructions live in the system prompt.
+// ---------------------------------------------------------------------------
+
+const DOC_GEN_USER = (
+  recipe: WorkatoRecipe,
+  lookupTables?: LookupTableContext[]
+) => {
+  const lines: string[] = [
+    "Create a data mapping document for this integration workflow. Be concise, business-focused, well-organized (tables/bullets), and include practical examples.",
+    "",
+    `Name: ${sanitizeForPrompt(recipe.name)}`,
+  ];
+
+  if (recipe.description) {
+    lines.push(`Description: ${sanitizeForPrompt(recipe.description)}`);
+  }
+
+  lines.push(`Apps: ${formatApps(recipe)}`);
+  lines.push("", `Recipe code:`, compactRecipeCode(recipe.code));
+
+  if (recipe.config?.length) {
+    lines.push("", `Connections: ${JSON.stringify(recipe.config)}`);
+  }
+
+  const lut = formatLookupTablesForPrompt(lookupTables);
+  if (lut) lines.push(lut);
+
+  lines.push("", 'Output valid JSON: {"markdown": "..."}');
+  return lines.join("\n");
+};
 
 const PROJECT_DOC_GEN_USER = (
   projectName: string,
   projectDescription: string | undefined,
-  recipes: WorkatoRecipe[]
-) => `
-I need you to create a data mapping document for an integration project that contains multiple connected workflows. The document should be:
+  recipes: WorkatoRecipe[],
+  lookupTables?: LookupTableContext[]
+) => {
+  const lines: string[] = [
+    `Create a data mapping document for this integration project (${recipes.length} workflows). Be concise, business-focused, well-organized (tables/bullets), and include practical examples.`,
+    "",
+    `Project: ${sanitizeForPrompt(projectName)}`,
+  ];
 
-1. **Concise and readable** - avoid technical jargon, use plain language
-2. **Business-focused** - explain "what" and "why" rather than "how"
-3. **Well-organized** - use clear sections with tables and bullet points
-4. **Practical** - include real-world examples and scenarios
+  if (projectDescription) {
+    lines.push(`Description: ${sanitizeForPrompt(projectDescription)}`);
+  }
 
-Please analyze the following integration project and create a comprehensive data mapping guide. Include all required sections for the integration as a whole, then for each recipe/workflow within the project.
+  for (let i = 0; i < recipes.length; i++) {
+    const r = recipes[i];
+    lines.push("", `--- Workflow ${i + 1}: ${sanitizeForPrompt(r.name)} ---`);
+    if (r.description) {
+      lines.push(`Description: ${sanitizeForPrompt(r.description)}`);
+    }
+    lines.push(`Apps: ${formatApps(r)}`);
+    lines.push(`Code: ${compactRecipeCode(r.code)}`);
+    if (r.config?.length) {
+      lines.push(`Connections: ${JSON.stringify(r.config)}`);
+    }
+  }
 
-${REQUIRED_SECTIONS}
+  const lut = formatLookupTablesForPrompt(lookupTables);
+  if (lut) lines.push(lut);
 
-${STYLE_GUIDELINES}
+  lines.push(
+    "",
+    "Structure: overview of all workflows → combined or per-workflow field mappings → per-workflow scenarios and sync rules → unified important notes.",
+    "",
+    'Output valid JSON: {"markdown": "..."}'
+  );
 
-### Integration Project to Analyze:
-
-Integration/Project: ${sanitizeForPrompt(projectName)}
-Description: ${sanitizeForPrompt(projectDescription ?? "(none)")}
-
-Recipes in this integration (${recipes.length} total):
-${recipes
-  .map(
-    (r, i) => `
---- Workflow ${i + 1}: ${sanitizeForPrompt(r.name)} ---
-Description: ${sanitizeForPrompt(r.description ?? "(none)")}
-Trigger: ${r.trigger_application ?? "unknown"}
-Actions: ${(r.action_applications ?? []).join(", ")}
-Configuration (JSON):
-${typeof r.code === "string" ? r.code : JSON.stringify(r.code)}
-Connections: ${JSON.stringify(r.config ?? [])}
-`
-  )
-  .join("\n")}
-
-Structure the document:
-1. Start with an overall integration overview covering all workflows
-2. Provide one combined field mapping table if fields are shared, or per-workflow tables if distinct
-3. Then cover each workflow with its own Common Scenarios and Sync Rules sections
-4. End with a unified Important Notes section
-
-Please generate the documentation following this structure and style.
-Output valid JSON with a single "markdown" key: {"markdown": "..."}
-`;
+  return lines.join("\n");
+};
 
 const SEMANTIC_SYSTEM = `You analyze changes between two versions of a Workato recipe. Determine if the change is semantically meaningful (affects behavior or documentation).`;
 
@@ -269,8 +341,8 @@ export function createAnthropicClient(config: AnthropicClientConfig): AIClient {
   }
 
   const client = new Anthropic({ apiKey: config.apiKey });
-  const docModel = config.docModel ?? "claude-3-5-haiku-20241022";
-  const qualityModel = config.qualityModel ?? "claude-3-5-sonnet-20241022";
+  const docModel = config.docModel ?? "claude-haiku-4-5-20251001";
+  const qualityModel = config.qualityModel ?? "claude-sonnet-4-5-20250929";
 
   return {
     async analyzeSemanticChange(oldRecipe, newRecipe) {
@@ -301,7 +373,7 @@ export function createAnthropicClient(config: AnthropicClientConfig): AIClient {
       }, { context: "analyzeSemanticChange" });
     },
 
-    async generateDocumentation(recipe): Promise<DocumentationResult> {
+    async generateDocumentation(recipe, lookupTables): Promise<DocumentationResult> {
       return withRetry(async () => {
         const response = await client.messages.create({
           model: docModel,
@@ -310,7 +382,7 @@ export function createAnthropicClient(config: AnthropicClientConfig): AIClient {
           messages: [
             {
               role: "user",
-              content: DOC_GEN_USER(recipe),
+              content: DOC_GEN_USER(recipe, lookupTables),
             },
           ],
           temperature: 0.3,
@@ -335,7 +407,8 @@ export function createAnthropicClient(config: AnthropicClientConfig): AIClient {
     async generateProjectDocumentation(
       projectName,
       projectDescription,
-      recipes
+      recipes,
+      lookupTables
     ): Promise<DocumentationResult> {
       return withRetry(async () => {
         const response = await client.messages.create({
@@ -348,7 +421,8 @@ export function createAnthropicClient(config: AnthropicClientConfig): AIClient {
               content: PROJECT_DOC_GEN_USER(
                 projectName,
                 projectDescription,
-                recipes
+                recipes,
+                lookupTables
               ),
             },
           ],

@@ -9,6 +9,10 @@ import { createFileSystemPublisher } from "../publishers/filesystem-publisher.js
 import type { Publisher } from "../publishers/publisher.js";
 import { createCorrelationLogger } from "../logger.js";
 import type { Logger } from "pino";
+import {
+  extractLookupTableReferencesFromRecipes,
+  resolveLookupTables,
+} from "./lookup-table-resolver.js";
 
 const WORKATO_TOKEN = process.env.WORKATO_API_TOKEN ?? "";
 const WORKATO_BASE_URL = process.env.WORKATO_BASE_URL;
@@ -189,10 +193,36 @@ export async function runDocumentationPipeline(
           if (!anyMeaningful) continue;
         }
 
+        // Resolve lookup tables referenced in any of the project's recipes
+        let lookupTables;
+        try {
+          const refs = extractLookupTableReferencesFromRecipes(
+            projectRecipes.map((r) => r.recipe)
+          );
+          lookupTables = await resolveLookupTables(
+            client,
+            managedUserId,
+            refs
+          );
+          if (lookupTables.length > 0) {
+            log.info(
+              { projectId, lookupTables: lookupTables.map((t) => t.name) },
+              "Resolved lookup tables for project"
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(
+            { projectId, error: msg },
+            "Failed to resolve lookup tables – continuing without them"
+          );
+        }
+
         const docResult = await aiClient.generateProjectDocumentation(
           project.name,
           project.description ?? undefined,
-          projectRecipes.map((r) => r.recipe)
+          projectRecipes.map((r) => r.recipe),
+          lookupTables
         );
 
         // Publish first — if this fails, we don't save snapshots,
