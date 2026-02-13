@@ -92,6 +92,12 @@ export class WorkatoClient {
   private readonly client: AxiosInstance;
 
   constructor(config: WorkatoClientConfig) {
+    if (!config.apiToken) {
+      throw new Error(
+        "WORKATO_API_TOKEN is required. Set it in your .env file or environment."
+      );
+    }
+
     const baseURL =
       config.baseUrl ??
       (config.datacenter
@@ -114,20 +120,12 @@ export class WorkatoClient {
     });
   }
 
-  private formatManagedUserId(
-    managedUserId: string | number,
-    env?: "dev" | "test" | "prod"
-  ): string {
-    const id =
+  private formatManagedUserId(managedUserId: string | number): string {
+    const raw =
       typeof managedUserId === "number"
         ? String(managedUserId)
-        : managedUserId.startsWith("E")
-          ? encodeURIComponent(managedUserId)
-          : managedUserId;
-    if (env) {
-      return `${id}_${env}`;
-    }
-    return id;
+        : managedUserId;
+    return encodeURIComponent(raw);
   }
 
   async listCustomers(params?: {
@@ -146,9 +144,11 @@ export class WorkatoClient {
     const all: WorkatoCustomer[] = [];
     let page = 1;
     const perPage = 100;
+    const maxPages = 200;
 
-    while (true) {
+    while (page <= maxPages) {
       const { result, count } = await this.listCustomers({ page, per_page: perPage });
+      if (result.length === 0) break;
       all.push(...result);
       if (all.length >= count) break;
       page++;
@@ -180,13 +180,15 @@ export class WorkatoClient {
     const all: WorkatoProject[] = [];
     let page = 1;
     const perPage = 100;
+    const maxPages = 200;
 
-    while (true) {
+    while (page <= maxPages) {
       const { result, count } = await this.listProjects(managedUserId, {
         page,
         per_page: perPage,
         updated_after: updatedAfter,
       });
+      if (result.length === 0) break;
       all.push(...result);
       if (all.length >= count) break;
       page++;
@@ -224,8 +226,9 @@ export class WorkatoClient {
     const all: WorkatoRecipe[] = [];
     let page = 1;
     const perPage = 100;
+    const maxPages = 500;
 
-    while (true) {
+    while (page <= maxPages) {
       const { result, count } = await this.listRecipes(managedUserId, {
         page,
         per_page: perPage,
@@ -233,6 +236,7 @@ export class WorkatoClient {
         folder_id: options?.folderId,
         with_subfolders: options?.withSubfolders,
       });
+      if (result.length === 0) break;
       all.push(...result);
       if (all.length >= count) break;
       page++;
@@ -301,21 +305,39 @@ export class WorkatoClient {
         lastErr = err instanceof Error ? err : new Error(String(err));
         if (!axios.isAxiosError(err)) throw lastErr;
 
-        const status = (err as AxiosError).response?.status;
+        const axiosErr = err as AxiosError<{
+          errors?: Array<{ code: number; title: string }>;
+        }>;
+        const status = axiosErr.response?.status;
+        const isNetworkError = !axiosErr.response; // ECONNRESET, ETIMEDOUT, DNS, etc.
         const isRetryable =
-          (status != null && status >= 500) || status === 429;
+          isNetworkError ||
+          (status != null && status >= 500) ||
+          status === 429;
 
         if (!isRetryable || attempt >= maxRetries) {
-          const axiosErr = err as AxiosError<{
-            errors?: Array<{ code: number; title: string }>;
-          }>;
           const errors = axiosErr.response?.data?.errors ?? [];
           const message =
             errors.map((e) => e.title).join("; ") || axiosErr.message;
-          throw new Error(`Workato API error: ${message}`);
+          const wrapped = new Error(
+            `Workato API error (${status ?? "network"}): ${message}`
+          );
+          wrapped.cause = err;
+          throw wrapped;
         }
 
-        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        // Respect Retry-After header on 429
+        let delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        if (status === 429) {
+          const retryAfter = axiosErr.response?.headers?.["retry-after"];
+          if (retryAfter) {
+            const parsed = Number(retryAfter);
+            if (!Number.isNaN(parsed) && parsed > 0) {
+              delay = Math.min(parsed * 1000, 60000);
+            }
+          }
+        }
+
         await new Promise((r) => setTimeout(r, delay));
       }
     }

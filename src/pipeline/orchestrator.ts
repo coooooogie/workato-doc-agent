@@ -7,6 +7,8 @@ import { createRunTracker } from "../rules/run-tracker.js";
 import { createAnthropicClient } from "../ai/anthropic-ai-client.js";
 import { createFileSystemPublisher } from "../publishers/filesystem-publisher.js";
 import type { Publisher } from "../publishers/publisher.js";
+import { createCorrelationLogger } from "../logger.js";
+import type { Logger } from "pino";
 
 const WORKATO_TOKEN = process.env.WORKATO_API_TOKEN ?? "";
 const WORKATO_BASE_URL = process.env.WORKATO_BASE_URL;
@@ -27,8 +29,24 @@ function slugify(name: string): string {
 
 export async function runDocumentationPipeline(
   customerId?: string,
-  forceRegenerate?: boolean
+  forceRegenerate?: boolean,
+  parentLogger?: Logger
 ): Promise<void> {
+  const log = parentLogger ?? createCorrelationLogger();
+
+  if (!WORKATO_TOKEN) {
+    throw new Error(
+      "WORKATO_API_TOKEN is required. Set it in your .env file or environment."
+    );
+  }
+  if (!ANTHROPIC_KEY) {
+    throw new Error(
+      "ANTHROPIC_API_KEY is required. Set it in your .env file or environment."
+    );
+  }
+
+  log.info({ customerId, forceRegenerate }, "Starting documentation pipeline");
+
   const storage = createSqliteStorage();
   const runTracker = createRunTracker(storage);
 
@@ -70,6 +88,24 @@ export async function runDocumentationPipeline(
 
     customersProcessed = fetchResult.customersProcessed;
     recipesFetched = fetchResult.recipesFetched;
+    if (fetchResult.customerErrors.length > 0) {
+      errors.push(...fetchResult.customerErrors);
+    }
+
+    log.info(
+      {
+        customersProcessed,
+        recipesFetched,
+        customerErrors: fetchResult.customerErrors.length,
+      },
+      "Fetch complete"
+    );
+
+    // Index recipes by key for O(1) lookup instead of O(n) find()
+    const recipeIndex = new Map<string, { recipe: typeof fetchResult.recipes[0]["recipe"]; managedUserId: string }>();
+    for (const entry of fetchResult.recipes) {
+      recipeIndex.set(`${entry.managedUserId}:${entry.recipe.id}`, entry);
+    }
 
     const changed = forceRegenerate
       ? fetchResult.recipes.map((r) => ({
@@ -82,15 +118,14 @@ export async function runDocumentationPipeline(
           (recipeId) => storage.getLatestSnapshot(recipeId)?.content_hash ?? null
         );
     recipesChanged = changed.length;
+    log.info({ recipesChanged }, "Change detection complete");
 
     const changedByProject = new Map<
       string,
       { managedUserId: string; projectId: number; recipeIds: Set<number> }
     >();
     for (const { recipeId, managedUserId } of changed) {
-      const recipeData = fetchResult.recipes.find(
-        (r) => r.recipe.id === recipeId && r.managedUserId === managedUserId
-      );
+      const recipeData = recipeIndex.get(`${managedUserId}:${recipeId}`);
       if (!recipeData?.recipe.project_id) continue;
       const key = `${managedUserId}:${recipeData.recipe.project_id}`;
       if (!changedByProject.has(key)) {
@@ -121,26 +156,29 @@ export async function runDocumentationPipeline(
 
         const hasNewOrForce = forceRegenerate || Array.from(recipeIds).some(
           (id) => {
-            const r = fetchResult.recipes.find(
-              (x) => x.recipe.id === id && x.managedUserId === managedUserId
-            );
+            const r = recipeIndex.get(`${managedUserId}:${id}`);
             return !r || !storage.getLatestSnapshot(id);
           }
         );
         if (!hasNewOrForce) {
           let anyMeaningful = false;
           for (const id of recipeIds) {
-            const r = fetchResult.recipes.find(
-              (x) => x.recipe.id === id && x.managedUserId === managedUserId
-            );
+            const r = recipeIndex.get(`${managedUserId}:${id}`);
             if (!r) continue;
             const prev = storage.getLatestSnapshot(id);
             if (!prev) {
               anyMeaningful = true;
               break;
             }
+            let oldRecipe: typeof r.recipe;
+            try {
+              oldRecipe = JSON.parse(prev.raw_json) as typeof r.recipe;
+            } catch {
+              anyMeaningful = true;
+              break;
+            }
             const semantic = await aiClient.analyzeSemanticChange(
-              JSON.parse(prev.raw_json) as typeof r.recipe,
+              oldRecipe,
               r.recipe
             );
             if (semantic.hasMeaningfulChange) {
@@ -157,17 +195,8 @@ export async function runDocumentationPipeline(
           projectRecipes.map((r) => r.recipe)
         );
 
-        for (const { recipe } of projectRecipes) {
-          const hash = computeRecipeHash(recipe);
-          storage.upsertSnapshot({
-            recipe_id: recipe.id,
-            managed_user_id: managedUserId,
-            content_hash: hash,
-            raw_json: JSON.stringify(recipe),
-            created_at: new Date().toISOString(),
-          });
-        }
-
+        // Publish first — if this fails, we don't save snapshots,
+        // so the next run will re-detect the changes and retry.
         const projectSlug = slugify(project.name);
         for (const pub of publishers) {
           await pub.publish(
@@ -182,6 +211,18 @@ export async function runDocumentationPipeline(
               isProjectDoc: true,
             }
           );
+        }
+
+        // Only save snapshots after successful publish.
+        for (const { recipe } of projectRecipes) {
+          const hash = computeRecipeHash(recipe);
+          storage.upsertSnapshot({
+            recipe_id: recipe.id,
+            managed_user_id: managedUserId,
+            content_hash: hash,
+            raw_json: JSON.stringify(recipe),
+            created_at: new Date().toISOString(),
+          });
         }
 
         projectsDocumented++;
@@ -218,6 +259,8 @@ export async function runDocumentationPipeline(
       errors: errors.join("; "),
     });
     throw err;
+  } finally {
+    storage.close();
   }
 }
 

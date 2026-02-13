@@ -1,17 +1,19 @@
 import { createHash } from "crypto";
 import type { WorkatoRecipe } from "../api/workato-client.js";
 
+const HASH_VERSION = "v2";
+
 export function computeRecipeHash(recipe: WorkatoRecipe): string {
-  const payload = JSON.stringify(
-    {
-      code: recipe.code,
-      name: recipe.name,
-      description: recipe.description ?? "",
-      config: recipe.config ?? [],
-    },
-    Object.keys({ code: 1, name: 1, description: 1, config: 1 }).sort()
-  );
-  return createHash("sha256").update(payload).digest("hex");
+  // Keys are in alphabetical order for deterministic serialization.
+  // Do NOT use a JSON.stringify replacer array — it filters nested object keys too.
+  const payload = JSON.stringify({
+    code: recipe.code,
+    config: recipe.config ?? [],
+    description: recipe.description ?? "",
+    name: recipe.name,
+  });
+  const hash = createHash("sha256").update(payload).digest("hex");
+  return `${HASH_VERSION}:${hash}`;
 }
 
 export interface ChangedRecipe {

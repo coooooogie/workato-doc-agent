@@ -16,7 +16,7 @@ async function runPipeline() {
   const log = logger.child({ correlationId });
   try {
     log.info("Starting scheduled documentation pipeline");
-    await runDocumentationPipeline();
+    await runDocumentationPipeline(undefined, undefined, log);
     log.info("Pipeline completed successfully");
   } catch (err) {
     log.error({ err }, "Pipeline failed");

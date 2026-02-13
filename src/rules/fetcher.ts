@@ -11,6 +11,7 @@ export interface FetchResult {
   projectsFetched: number;
   recipesFetched: number;
   recipes: Array<{ recipe: WorkatoRecipe; managedUserId: string }>;
+  customerErrors: string[];
 }
 
 export async function fetchAndStoreRecipes(
@@ -38,61 +39,67 @@ export async function fetchAndStoreRecipes(
   const recipes: Array<{ recipe: WorkatoRecipe; managedUserId: string }> = [];
   let totalRecipes = 0;
   let totalProjects = 0;
+  const customerErrors: string[] = [];
 
   for (const customer of customers) {
-    const managedUserId = String(customer.id);
-    storage.upsertCustomer({
-      id: customer.id,
-      managed_user_id: managedUserId,
-      external_id: customer.external_id ?? null,
-      name: customer.name,
-      created_at: customer.created_at,
-      updated_at: customer.updated_at,
-    });
-
-    const projects = await client.listAllProjects(customer.id);
-    const now = new Date().toISOString();
-    for (const p of projects) {
-      storage.upsertProject({
-        id: p.id,
-        folder_id: p.folder_id,
+    try {
+      const managedUserId = String(customer.id);
+      storage.upsertCustomer({
+        id: customer.id,
         managed_user_id: managedUserId,
-        name: p.name,
-        description: p.description ?? null,
-        created_at: now,
-        updated_at: now,
+        external_id: customer.external_id ?? null,
+        name: customer.name,
+        created_at: customer.created_at,
+        updated_at: customer.updated_at,
       });
-      totalProjects++;
-    }
 
-    const seenRecipeIds = new Set<number>();
-    for (const p of projects) {
-      const projectRecipes = await client.listAllRecipes(customer.id, {
-        updatedAfter: options.updatedAfter,
-        folderId: String(p.folder_id),
-        withSubfolders: false,
-      });
-      for (const r of projectRecipes) {
-        if (!r.name.startsWith("[active]")) continue;
-        if (seenRecipeIds.has(r.id)) continue;
-        seenRecipeIds.add(r.id);
-
-        const recipeRecord: Recipe = {
-          id: r.id,
+      const projects = await client.listAllProjects(customer.id);
+      const now = new Date().toISOString();
+      for (const p of projects) {
+        storage.upsertProject({
+          id: p.id,
+          folder_id: p.folder_id,
           managed_user_id: managedUserId,
-          project_id: r.project_id ?? p.id,
-          folder_id: r.folder_id ?? null,
-          name: r.name,
-          description: r.description ?? null,
-          raw_json: JSON.stringify(r),
-          created_at: r.created_at,
-          updated_at: r.updated_at,
-        };
-        storage.upsertRecipe(recipeRecord);
-
-        recipes.push({ recipe: r, managedUserId });
-        totalRecipes++;
+          name: p.name,
+          description: p.description ?? null,
+          created_at: now,
+          updated_at: now,
+        });
+        totalProjects++;
       }
+
+      const seenRecipeIds = new Set<number>();
+      for (const p of projects) {
+        const projectRecipes = await client.listAllRecipes(customer.id, {
+          updatedAfter: options.updatedAfter,
+          folderId: String(p.folder_id),
+          withSubfolders: false,
+        });
+        for (const r of projectRecipes) {
+          if (!r.name.startsWith("[active]")) continue;
+          if (seenRecipeIds.has(r.id)) continue;
+          seenRecipeIds.add(r.id);
+
+          const recipeRecord: Recipe = {
+            id: r.id,
+            managed_user_id: managedUserId,
+            project_id: r.project_id ?? p.id,
+            folder_id: r.folder_id ?? null,
+            name: r.name,
+            description: r.description ?? null,
+            raw_json: JSON.stringify(r),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+          };
+          storage.upsertRecipe(recipeRecord);
+
+          recipes.push({ recipe: r, managedUserId });
+          totalRecipes++;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      customerErrors.push(`Customer ${customer.id}: ${msg}`);
     }
   }
 
@@ -101,5 +108,6 @@ export async function fetchAndStoreRecipes(
     projectsFetched: totalProjects,
     recipesFetched: totalRecipes,
     recipes,
+    customerErrors,
   };
 }

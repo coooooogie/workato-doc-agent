@@ -9,6 +9,7 @@ import type {
 
 export interface Storage {
   init(): void;
+  close(): void;
 
   upsertCustomer(customer: Customer): void;
   upsertProject(project: Project): void;

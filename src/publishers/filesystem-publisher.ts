@@ -40,7 +40,7 @@ export function createFileSystemPublisher(
   </style>
 </head>
 <body>
-${doc.contentHtml}
+${sanitizeHtml(doc.contentHtml)}
 </body>
 </html>`;
 
@@ -56,4 +56,20 @@ function escapeHtml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/**
+ * Strip dangerous HTML tags from AI-generated content.
+ * Allows standard content tags but removes script, iframe, object, embed, etc.
+ */
+function sanitizeHtml(html: string): string {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+    .replace(/<iframe\b[^>]*>.*?<\/iframe>/gi, "")
+    .replace(/<object\b[^>]*>.*?<\/object>/gi, "")
+    .replace(/<embed\b[^>]*\/?>/gi, "")
+    .replace(/<link\b[^>]*>/gi, "")
+    .replace(/\bon\w+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\bon\w+\s*=\s*'[^']*'/gi, "")
+    .replace(/javascript\s*:/gi, "");
 }
